@@ -10,7 +10,9 @@ from zoneinfo import ZoneInfo
 # CONFIGURATION
 # ============================================================
 
-CHECK_INTERVAL = 30  # vérification toutes les 30 secondes
+CHECK_INTERVAL = 30
+CONFIRMATIONS_REQUIRED = 2
+COOLDOWN_SECONDS = 120
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -31,12 +33,41 @@ HEADERS = {
 
 TIMEZONE = ZoneInfo("America/Toronto")
 
-# Garde en mémoire le dernier #1 de chaque session
-last_number_one = {
-    "PRE-MARKET": None,
-    "MARKET HOURS": None,
-    "AFTER HOURS": None,
-}
+last_confirmed_ticker = None
+last_confirmed_session = None
+
+candidate_ticker = None
+candidate_count = 0
+
+last_alert_time = {}
+last_alerted_ticker = None
+
+
+# ============================================================
+# SESSION ACTIVE
+# ============================================================
+
+def get_active_session():
+    now = datetime.now(TIMEZONE)
+
+    hour = now.hour
+    minute = now.minute
+    total_minutes = hour * 60 + minute
+
+    # 5:00 -> 9:29
+    if 300 <= total_minutes <= 569:
+        return "PRE-MARKET"
+
+    # 9:30 -> 15:59
+    if 570 <= total_minutes <= 959:
+        return "MARKET HOURS"
+
+    # 16:00 -> 20:00
+    if 960 <= total_minutes <= 1200:
+        return "AFTER HOURS"
+
+    return None
+
 
 # ============================================================
 # TELEGRAM
@@ -45,12 +76,12 @@ last_number_one = {
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("ERREUR: variables Telegram manquantes.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": TELEGRAM_CHAT_ID.strip(),
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -61,9 +92,14 @@ def send_telegram(message):
 
         if not response.ok:
             print("Erreur Telegram:", response.status_code, response.text)
+            return False
+
+        return True
 
     except Exception as e:
         print("Erreur Telegram:", e)
+        return False
+
 
 # ============================================================
 # EXTRACTION DU #1 GAINER
@@ -72,25 +108,22 @@ def send_telegram(message):
 def clean_text(text):
     return " ".join(text.split())
 
+
 def get_number_one(session_name, url):
     try:
         response = requests.get(
             url,
             headers=HEADERS,
             timeout=20,
-            params={"_": int(time.time())},  # évite certaines mises en cache
+            params={"_": int(time.time())},
         )
 
         response.raise_for_status()
-
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Cherche toutes les tables de la page
         tables = soup.find_all("table")
 
         for table in tables:
-
-            # Texte près de la table pour identifier Gainers
             surrounding_text = ""
 
             previous = table.find_previous(
@@ -98,7 +131,9 @@ def get_number_one(session_name, url):
             )
 
             if previous:
-                surrounding_text = clean_text(previous.get_text(" ", strip=True))
+                surrounding_text = clean_text(
+                    previous.get_text(" ", strip=True)
+                )
 
             headers = [
                 clean_text(th.get_text(" ", strip=True))
@@ -106,9 +141,6 @@ def get_number_one(session_name, url):
             ]
 
             headers_lower = [h.lower() for h in headers]
-
-            # Table attendue :
-            # %Chg | Last | Symb | Company | Volume
 
             has_symbol = any(
                 h in ["symb", "symbol", "ticker"]
@@ -123,12 +155,13 @@ def get_number_one(session_name, url):
             if not has_symbol or not has_change:
                 continue
 
-            # Priorité aux tables associées aux gainers
             parent_text = clean_text(
                 table.parent.get_text(" ", strip=True)
             ).lower()
 
-            context = (surrounding_text + " " + parent_text[:500]).lower()
+            context = (
+                surrounding_text + " " + parent_text[:500]
+            ).lower()
 
             if "gainer" not in context:
                 continue
@@ -138,7 +171,6 @@ def get_number_one(session_name, url):
             if len(rows) < 2:
                 continue
 
-            # Première ligne de données = #1
             cells = rows[1].find_all(["td", "th"])
 
             values = [
@@ -149,7 +181,6 @@ def get_number_one(session_name, url):
             if len(values) < 3:
                 continue
 
-            # Repère les colonnes dynamiquement
             symbol_index = None
             change_index = None
             last_index = None
@@ -178,7 +209,6 @@ def get_number_one(session_name, url):
 
             ticker = values[symbol_index].upper().strip()
 
-            # Validation simple d'un ticker US
             if not re.fullmatch(r"[A-Z0-9.\-]{1,10}", ticker):
                 continue
 
@@ -223,34 +253,90 @@ def get_number_one(session_name, url):
         print(f"[{session_name}] Erreur:", e)
         return None
 
+
 # ============================================================
-# NOTIFICATION
+# LOGIQUE D'ALERTE
 # ============================================================
 
-def number_one_changed(stock):
-    session = stock["session"]
+def process_candidate(stock):
+    global candidate_ticker
+    global candidate_count
+    global last_confirmed_ticker
+    global last_confirmed_session
+    global last_alerted_ticker
+
     ticker = stock["ticker"]
+    session = stock["session"]
 
-    previous = last_number_one[session]
+    # Reset si on change de session
+    if last_confirmed_session != session:
+        print(f"Changement de session -> {session}")
 
-    # Premier passage :
-    # on enregistre simplement le #1 actuel sans envoyer d'alerte.
-    if previous is None:
-        last_number_one[session] = ticker
+        last_confirmed_session = session
+        last_confirmed_ticker = None
+        candidate_ticker = None
+        candidate_count = 0
+        last_alerted_ticker = None
+
+    # Nouveau candidat
+    if ticker != candidate_ticker:
+        candidate_ticker = ticker
+        candidate_count = 1
+
         print(
-            f"[{session}] Premier #1 enregistré: "
-            f"{ticker} {stock['change']}"
+            f"[{session}] Candidat #1: "
+            f"{ticker} (1/{CONFIRMATIONS_REQUIRED})"
         )
+
         return
 
-    # Toujours le même #1 → aucune notification
-    if ticker == previous:
+    # Même candidat une autre fois
+    candidate_count += 1
+
+    print(
+        f"[{session}] Candidat #1: "
+        f"{ticker} ({candidate_count}/{CONFIRMATIONS_REQUIRED})"
+    )
+
+    if candidate_count < CONFIRMATIONS_REQUIRED:
         return
 
-    # Nouveau #1
-    last_number_one[session] = ticker
+    # Premier #1 confirmé de la session
+    if last_confirmed_ticker is None:
+        last_confirmed_ticker = ticker
+
+        print(
+            f"[{session}] Premier #1 confirmé enregistré: "
+            f"{ticker}"
+        )
+
+        return
+
+    # Toujours le même #1
+    if ticker == last_confirmed_ticker:
+        return
+
+    old_ticker = last_confirmed_ticker
+    last_confirmed_ticker = ticker
 
     now = datetime.now(TIMEZONE)
+
+    # Cooldown anti-spam
+    if ticker in last_alert_time:
+        elapsed = (
+            now - last_alert_time[ticker]
+        ).total_seconds()
+
+        if elapsed < COOLDOWN_SECONDS:
+            print(
+                f"[{session}] {ticker} reprend #1 mais cooldown actif "
+                f"({int(elapsed)} sec)"
+            )
+            return
+
+    # Évite répétition inutile
+    if ticker == last_alerted_ticker:
+        return
 
     message = (
         f"🚨 <b>NOUVEAU #1 GAINER</b>\n\n"
@@ -266,56 +352,70 @@ def number_one_changed(stock):
     message += (
         f"\n⏰ <b>{session}</b>\n"
         f"🕐 {now.strftime('%H:%M:%S')} ET\n\n"
-        f"Ancien #1 : ${previous}\n"
+        f"Ancien #1 : ${old_ticker}\n"
         f"🟢 Nouveau #1 : <b>${ticker}</b>\n\n"
         f"{stock['url']}"
     )
 
-    send_telegram(message)
+    if send_telegram(message):
+        last_alert_time[ticker] = now
+        last_alerted_ticker = ticker
 
-    print(
-        f"ALERTE: [{session}] "
-        f"{previous} → {ticker} ({stock['change']})"
-    )
+        print(
+            f"ALERTE ENVOYÉE: "
+            f"[{session}] {old_ticker} -> {ticker}"
+        )
+
 
 # ============================================================
 # PROGRAMME PRINCIPAL
 # ============================================================
 
 def main():
-
     print("==========================================")
-    print(" StockMarketWatch #1 Gainer Monitor")
-    print(" Vérification toutes les 30 secondes")
+    print(" StockMarketWatch #1 Gainer Monitor V2")
+    print(" Pre-Market commence à 5:00 ET")
+    print(" Confirmation x2")
+    print(" Cooldown 2 minutes")
     print("==========================================")
 
     send_telegram(
-        "✅ <b>StockMarketWatch Monitor démarré</b>\n\n"
-        "Surveillance active :\n"
-        "🌅 Pre-Market\n"
-        "🔔 Market Hours\n"
-        "🌙 After Hours\n\n"
-        "Vérification toutes les 30 secondes."
+        "✅ <b>StockWatch V2 démarré</b>\n\n"
+        "🌅 05:00–09:29 : Pre-Market\n"
+        "🔔 09:30–15:59 : Market Hours\n"
+        "🌙 16:00–20:00 : After Hours\n\n"
+        "Confirmation du #1 sur 2 vérifications.\n"
+        "Anti-spam activé."
     )
 
     while True:
+        session = get_active_session()
 
-        for session_name, url in PAGES.items():
+        if session is None:
+            now = datetime.now(TIMEZONE)
 
-            stock = get_number_one(session_name, url)
+            print(
+                f"[{now.strftime('%H:%M:%S')}] "
+                "Hors horaire -> aucune surveillance"
+            )
 
-            if stock:
-                print(
-                    f"[{datetime.now(TIMEZONE).strftime('%H:%M:%S')}] "
-                    f"{session_name}: "
-                    f"#{stock['ticker']} {stock['change']}"
-                )
+            time.sleep(CHECK_INTERVAL)
+            continue
 
-                number_one_changed(stock)
+        url = PAGES[session]
+        stock = get_number_one(session, url)
 
-            time.sleep(2)
+        if stock:
+            print(
+                f"[{datetime.now(TIMEZONE).strftime('%H:%M:%S')}] "
+                f"{session}: "
+                f"#{stock['ticker']} {stock['change']}"
+            )
+
+            process_candidate(stock)
 
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
