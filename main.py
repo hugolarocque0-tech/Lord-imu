@@ -13,7 +13,10 @@ from zoneinfo import ZoneInfo
 CHECK_INTERVAL = 30
 CONFIRMATIONS_REQUIRED = 2
 COOLDOWN_SECONDS = 120
-
+BLOCKED_TICKERS = {
+    "TPC",
+    "BCPC",
+}
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -267,7 +270,9 @@ def process_candidate(stock):
 
     ticker = stock["ticker"]
     session = stock["session"]
-
+    if ticker in BLOCKED_TICKERS:
+        print(f"[{session}] {ticker} est bloqué -> aucune alerte")
+        return
     # Reset si on change de session
     if last_confirmed_session != session:
         print(f"Changement de session -> {session}")
